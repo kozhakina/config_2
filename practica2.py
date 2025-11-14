@@ -3,11 +3,12 @@ import os
 import re
 import sys
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import socket
 import json
 from collections import deque, defaultdict
 import tempfile
+import base64
 
 # Обход бага с DNS в Windows
 socket.getaddrinfo = lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
@@ -70,14 +71,12 @@ def fetch_pom_from_remote(repo_url: str, package_name: str) -> str:
     base_url = f"{repo_url.rstrip('/')}/{group_path}/{artifact_id}"
     metadata_url = f"{base_url}/maven-metadata.xml"
 
-    # Загрузка metadata
     try:
         with urllib.request.urlopen(metadata_url) as response:
             metadata = response.read().decode('utf-8')
     except Exception as e:
         raise RuntimeError(f"Не удалось загрузить maven-metadata.xml из {metadata_url}: {e}")
 
-    # Поиск версии
     version = None
     for pattern in [r'<release>([^<]+)</release>', r'<latest>([^<]+)</latest>']:
         match = re.search(pattern, metadata)
@@ -93,7 +92,6 @@ def fetch_pom_from_remote(repo_url: str, package_name: str) -> str:
     if not version:
         raise RuntimeError("Не удалось определить версию пакета.")
 
-    # Загрузка pom.xml
     pom_url = f"{base_url}/{version}/{artifact_id}-{version}.pom"
     try:
         with urllib.request.urlopen(pom_url) as response:
@@ -168,7 +166,6 @@ def bfs_build_dependency_graph(
                 nodes.add(dep)
                 queue.append((dep, curr_depth + 1))
 
-    # Уникальные циклы
     unique_cycles = []
     seen = set()
     for cyc in cycles:
@@ -193,7 +190,6 @@ def bfs_reverse_dependencies(
     fetch_deps_func,
     filter_substring: str = ""
 ) -> dict:
-    # Шаг 1: построить полный прямой граф
     forward_edges = []
     filtered_out = set()
 
@@ -211,19 +207,14 @@ def bfs_reverse_dependencies(
                 continue
             forward_edges.append((pkg, dep))
 
-    # Шаг 2: построить обратный граф
     reverse_adj = defaultdict(list)
     for src, dst in forward_edges:
         reverse_adj[dst].append(src)
 
-    # Шаг 3: BFS от target по обратному графу
     dependents = set()
     visited = set()
-    queue = deque()
-
-    if target_package in reverse_adj:
-        queue.append(target_package)
-        visited.add(target_package)
+    queue = deque([target_package])
+    visited.add(target_package)
 
     while queue:
         current = queue.popleft()
@@ -233,16 +224,9 @@ def bfs_reverse_dependencies(
                 dependents.add(depender)
                 queue.append(depender)
 
-    # Исключаем сам пакет (если самозависимость)
     dependents.discard(target_package)
 
-    # Собираем рёбра зависимостей
-    edges = []
-    for dep in dependents:
-        for src, dst in forward_edges:
-            if src == dep and dst == target_package:
-                edges.append((dep, target_package))
-            # Ищем транзитивные? → достаточно прямых для вывода
+    edges = [(dep, target_package) for dep in dependents if (dep, target_package) in forward_edges]
     return {
         'dependents': dependents,
         'edges': edges,
@@ -250,24 +234,103 @@ def bfs_reverse_dependencies(
     }
 
 
+# =============== ЭТАП 5: ВИЗУАЛИЗАЦИЯ ===============
+
+def generate_plantuml(graph: dict, start_package: str) -> str:
+    """Генерирует PlantUML-код для графа зависимостей."""
+    lines = [
+        "@startuml",
+        "skinparam backgroundColor transparent",
+        "skinparam shadowing false",
+        "skinparam arrowColor #333333",
+        "skinparam nodeFontSize 13",
+        "skinparam nodeFontName SansSerif"
+    ]
+
+    # Узлы
+    for node in sorted(graph['nodes']):
+        if node == start_package:
+            lines.append(f'node "{node}" << (S,#77DD77) >>')
+        else:
+            lines.append(f'node "{node}"')
+
+    # Рёбра
+    for src, dst in sorted(graph['edges']):
+        style = ""
+        if [src, dst] in graph['cycles'] or [dst, src] in graph['cycles']:
+            style = " #red,dashed"
+        lines.append(f'"{src}" --> "{dst}"{style}')
+
+    lines.append("@enduml")
+    return "\n".join(lines)
+
+
+def save_plantuml_as_png(plantuml_code: str, output_path: str):
+    """Сохраняет PlantUML-диаграмму как PNG через публичный сервер."""
+    # Кодируем в zlib + base64 (формат PlantUML)
+    compressed = plantuml_code.encode('utf-8')
+    compressed = base64.b64encode(compressed).decode('ascii')
+    # Замена: PlantUML требует замены некоторых символов
+    compressed = compressed.replace('+', '-').replace('/', '_')
+
+    url = f"https://www.plantuml.com/plantuml/png/{compressed}"
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            data = response.read()
+        with open(output_path, 'wb') as f:
+            f.write(data)
+        print(f"Изображение сохранено: {output_path}")
+    except Exception as e:
+        print(f"⚠ Не удалось сохранить PNG: {e}", file=sys.stderr)
+        print("   Совет: проверьте подключение к интернету и длину диаграммы (макс. ~2000 символов).")
+
+
+def print_ascii_tree(graph: dict, start_package: str):
+    """Выводит зависимости в виде ASCII-дерева с обработкой циклов."""
+    print(f"\n=== ASCII-дерево зависимостей для {start_package} ===")
+
+    from collections import defaultdict
+    children = defaultdict(list)
+    for src, dst in graph['edges']:
+        children[src].append(dst)
+
+    def print_node(pkg, prefix="", is_last=True, visited=None):
+        if visited is None:
+            visited = set()
+        if pkg in visited:
+            print(prefix + ("└── " if is_last else "├── ") + f"{pkg} [CYCLE]")
+            return
+        visited.add(pkg)
+
+        connector = "└── " if is_last else "├── "
+        print(prefix + connector + pkg)
+        next_prefix = prefix + ("    " if is_last else "│   ")
+        deps = sorted(children.get(pkg, []))
+        for i, dep in enumerate(deps):
+            is_last_dep = (i == len(deps) - 1)
+            print_node(dep, next_prefix, is_last_dep, visited.copy())
+
+    print_node(start_package)
+
 # =============== ОСНОВНАЯ ФУНКЦИЯ ===============
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Инструмент анализа графа зависимостей (этапы 1–4)."
+        description="Инструмент анализа графа зависимостей (этапы 1–5)."
     )
     parser.add_argument('--package', type=validate_package_name, required=True)
     parser.add_argument('--repo-source', type=str, required=True)
     parser.add_argument('--repo-mode', type=validate_repo_mode, required=True)
     parser.add_argument('--output-image', type=validate_output_file, required=True)
-    parser.add_argument('--ascii-tree', action='store_true')
+    parser.add_argument('--ascii-tree', action='store_true',
+                        help='Вывести дерево зависимостей в ASCII-формате.')
     parser.add_argument('--filter', type=str, default='')
     parser.add_argument('--reverse', action='store_true',
                         help='Вывести обратные зависимости (только в mock-режиме)')
 
     args = parser.parse_args()
 
-    # Валидация источника
     if args.repo_mode == 'remote':
         parsed = urlparse(args.repo_source)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc:
@@ -278,16 +341,15 @@ def main():
             print(f"Ошибка: файл не найден: {args.repo_source}", file=sys.stderr)
             sys.exit(1)
 
-    # Вывод параметров
     print("Настроенные параметры:")
     print(f"  package: {args.package}")
     print(f"  repo_source: {args.repo_source}")
     print(f"  repo_mode: {args.repo_mode}")
     print(f"  output_image: {args.output_image}")
+    print(f"  ascii_tree: {args.ascii_tree}")
     print(f"  filter: '{args.filter}'")
     print(f"  reverse: {args.reverse}\n")
 
-    # Функция получения зависимостей
     if args.repo_mode == 'remote':
         fetch_deps = lambda pkg: parse_maven_dependencies(
             fetch_pom_from_remote(args.repo_source, pkg)
@@ -306,7 +368,7 @@ def main():
             filter_substring=args.filter
         )
     except Exception as e:
-        print(f"Ошибка при построении прямого графа: {e}", file=sys.stderr)
+        print(f"Ошибка при построении графа: {e}", file=sys.stderr)
         sys.exit(1)
 
     print("=== Этап 3: прямые и транзитивные зависимости ===")
@@ -356,18 +418,36 @@ def main():
         else:
             print("  Нет.")
 
-        if rev['filtered_out']:
-            print("Отфильтровано при построении:", ", ".join(sorted(rev['filtered_out'])))
+    # === Этап 5: визуализация ===
+    print("\n=== Этап 5: визуализация ===")
+
+    # 1. PlantUML
+    plantuml_code = generate_plantuml(graph, args.package)
+    print("Сгенерирован PlantUML-код (фрагмент):")
+    for line in plantuml_code.splitlines()[:8]:
+        print(f"  {line}")
+    print("  ...")
+
+    # 2. Сохранение PNG
+    try:
+        save_plantuml_as_png(plantuml_code, args.output_image)
+    except Exception as e:
+        print(f"⚠ Пропущено сохранение PNG: {e}")
+
+    # 3. ASCII-tree
+    if args.ascii_tree:
+        print_ascii_tree(graph, args.package)
 
     # === Демо ===
-    if args.repo_mode == 'mock' and not args.reverse:
+    if args.repo_mode == 'mock' and not args.reverse and not args.ascii_tree:
         demo = {"A": ["B", "C"], "B": ["D"], "C": ["D", "E"], "D": [], "E": ["B"]}
         demo_path = os.path.join(tempfile.gettempdir(), "demo_repo.json")
         with open(demo_path, 'w', encoding='utf-8') as f:
             json.dump(demo, f)
-        print(f"\n[ДЕМО] Примеры:")
-        print(f"  Прямые:   python practica2.py --package A --repo-mode mock --repo-source {demo_path} --output-image x.png")
-        print(f"  Обратные: python practica2.py --package B --repo-mode mock --repo-source {demo_path} --output-image x.png --reverse")
+        print(f"\n[ДЕМО] Запустите:")
+        print(f"  python practica2.py --package A --repo-mode mock --repo-source {demo_path} --output-image A_deps.png --ascii-tree")
+        print(f"  python practica2.py --package E --repo-mode mock --repo-source {demo_path} --output-image E_deps.png")
+        print(f"  python practica2.py --package B --repo-mode mock --repo-source {demo_path} --output-image B_deps.png --reverse")
 
 
 if __name__ == "__main__":
