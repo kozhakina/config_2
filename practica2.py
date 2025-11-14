@@ -6,31 +6,19 @@ import urllib.request
 from urllib.parse import urlparse
 import socket
 import json
-from collections import deque
+from collections import deque, defaultdict
 import tempfile
 
+# Обход бага с DNS в Windows
 socket.getaddrinfo = lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (args[0], args[1]))]
 
+
+# =============== ВАЛИДАЦИЯ АРГУМЕНТОВ ===============
 
 def validate_package_name(name: str) -> str:
     if not name or not name.strip():
         raise argparse.ArgumentTypeError("Имя пакета не может быть пустым.")
     return name.strip()
-
-
-def validate_repo_source(source: str) -> str:
-    if not source or not source.strip():
-        raise argparse.ArgumentTypeError("URL репозитория или путь к файлу не может быть пустым.")
-    source = source.strip()
-    parsed = urlparse(source)
-    if parsed.scheme in ('http', 'https'):
-        if not parsed.netloc:
-            raise argparse.ArgumentTypeError(f"Некорректный URL: {source}")
-    else:
-        # Для mock-mode — проверим, что путь существует, если это файл
-        if args.repo_mode == 'mock':  # временно, т.к. args ещё нет — исправим ниже
-            pass
-    return source
 
 
 def validate_repo_mode(mode: str) -> str:
@@ -49,8 +37,10 @@ def validate_output_file(filename: str) -> str:
     return filename
 
 
+# =============== РАБОТА С MAVEN (remote) ===============
+
 def parse_maven_dependencies(pom_content: str) -> list:
-    """Извлекает прямые зависимости из содержимого pom.xml (только <dependencies>, не <dependencyManagement>)."""
+    """Извлекает прямые зависимости из pom.xml."""
     dependencies = []
     dep_section_match = re.search(r'<dependencies>(.*?)</dependencies>', pom_content, re.DOTALL | re.IGNORECASE)
     if not dep_section_match:
@@ -60,14 +50,12 @@ def parse_maven_dependencies(pom_content: str) -> list:
     dep_blocks = re.findall(r'<dependency>(.*?)</dependency>', dep_section, re.DOTALL | re.IGNORECASE)
 
     for block in dep_blocks:
-        group_id_match = re.search(r'<groupId>(.*?)</groupId>', block, re.IGNORECASE)
-        artifact_id_match = re.search(r'<artifactId>(.*?)</artifactId>', block, re.IGNORECASE)
-
-        group_id = group_id_match.group(1).strip() if group_id_match else None
-        artifact_id = artifact_id_match.group(1).strip() if artifact_id_match else None
-
-        if group_id and artifact_id:
-            dependencies.append(f"{group_id}:{artifact_id}")
+        group_id = re.search(r'<groupId>(.*?)</groupId>', block, re.IGNORECASE)
+        artifact_id = re.search(r'<artifactId>(.*?)</artifactId>', block, re.IGNORECASE)
+        gid = group_id.group(1).strip() if group_id else None
+        aid = artifact_id.group(1).strip() if artifact_id else None
+        if gid and aid:
+            dependencies.append(f"{gid}:{artifact_id}")
 
     return dependencies
 
@@ -80,23 +68,22 @@ def fetch_pom_from_remote(repo_url: str, package_name: str) -> str:
     group_id, artifact_id = parts
     group_path = group_id.replace('.', '/')
     base_url = f"{repo_url.rstrip('/')}/{group_path}/{artifact_id}"
-
     metadata_url = f"{base_url}/maven-metadata.xml"
+
+    # Загрузка metadata
     try:
         with urllib.request.urlopen(metadata_url) as response:
             metadata = response.read().decode('utf-8')
     except Exception as e:
         raise RuntimeError(f"Не удалось загрузить maven-metadata.xml из {metadata_url}: {e}")
 
+    # Поиск версии
     version = None
-    release_match = re.search(r'<release>([^<]+)</release>', metadata)
-    if release_match:
-        version = release_match.group(1).strip()
-
-    if not version:
-        latest_match = re.search(r'<latest>([^<]+)</latest>', metadata)
-        if latest_match:
-            version = latest_match.group(1).strip()
+    for pattern in [r'<release>([^<]+)</release>', r'<latest>([^<]+)</latest>']:
+        match = re.search(pattern, metadata)
+        if match:
+            version = match.group(1).strip()
+            break
 
     if not version:
         versions = re.findall(r'<version>([^<]+)</version>', metadata)
@@ -104,88 +91,56 @@ def fetch_pom_from_remote(repo_url: str, package_name: str) -> str:
             version = versions[-1].strip()
 
     if not version:
-        raise RuntimeError(
-            "Не удалось определить версию: в maven-metadata.xml отсутствуют <release>, <latest> и <version>."
-        )
+        raise RuntimeError("Не удалось определить версию пакета.")
 
+    # Загрузка pom.xml
     pom_url = f"{base_url}/{version}/{artifact_id}-{version}.pom"
-
     try:
         with urllib.request.urlopen(pom_url) as response:
             return response.read().decode('utf-8')
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            raise RuntimeError(f"pom.xml не найден по адресу: {pom_url} (проверьте имя пакета и доступность репозитория)")
+            raise RuntimeError(f"pom.xml не найден: {pom_url}")
         raise RuntimeError(f"HTTP {e.code} при загрузке {pom_url}: {e}")
     except Exception as e:
         raise RuntimeError(f"Не удалось загрузить pom.xml: {e}")
 
 
-# ============== НОВЫЕ ФУНКЦИИ ДЛЯ ЭТАПА 3 ==============
+# =============== РАБОТА С MOCK (JSON) ===============
 
 def fetch_dependencies_mock(mock_file_path: str, package_name: str) -> list:
-    """
-    Загружает прямые зависимости для package_name из JSON-файла вида:
-    {
-      "A": ["B", "C"],
-      "B": ["D"],
-      "C": ["D", "E"],
-      "D": [],
-      "E": ["B"]   ← цикл: E → B → D, и если B→E — цикл
-    }
-    """
     if not os.path.isfile(mock_file_path):
-        raise FileNotFoundError(f"Файл тестового репозитория не найден: {mock_file_path}")
+        raise FileNotFoundError(f"Файл не найден: {mock_file_path}")
 
     try:
         with open(mock_file_path, 'r', encoding='utf-8') as f:
             repo = json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Некорректный JSON в файле {mock_file_path}: {e}")
+        raise ValueError(f"Некорректный JSON: {e}")
 
     if package_name not in repo:
-        raise ValueError(f"Пакет '{package_name}' отсутствует в тестовом репозитории.")
+        raise ValueError(f"Пакет '{package_name}' отсутствует в репозитории.")
 
-    dependencies = repo[package_name]
-    if not isinstance(dependencies, list):
-        raise ValueError(f"Зависимости для '{package_name}' должны быть списком.")
-    return [str(dep).strip() for dep in dependencies if dep]
+    deps = repo[package_name]
+    if not isinstance(deps, list):
+        raise ValueError(f"Зависимости должны быть списком.")
+    return [str(d).strip() for d in deps if d]
 
+
+# =============== BFS: ПРЯМОЙ ГРАФ (этап 3) ===============
 
 def bfs_build_dependency_graph(
     start_package: str,
     fetch_deps_func,
     filter_substring: str = ""
 ) -> dict:
-    """
-    Строит граф зависимостей BFS без рекурсии.
-    :param start_package: начальный пакет
-    :param fetch_deps_func: функция (package_name) → list[dep_name]
-    :param filter_substring: подстрока для фильтрации (если dep содержит её — пропускаем)
-    :return: {
-        'nodes': set[str],
-        'edges': list[(from, to)],
-        'cycles': list[list[str]],  # циклы в виде [A, B, C, A] — но без дублей
-        'filtered_out': set[str]
-    }
-    """
     nodes = set()
     edges = []
     cycles = []
     filtered_out = set()
 
-    # Обход BFS
-    queue = deque()
-    # Для обнаружения циклов: храним путь до текущего узла
-    # key: узел, value: список предков в текущем пути (в порядке BFS-поиска)
-    # Но BFS не даёт полного пути — для простоты будем проверять: если dep уже в nodes **и** в текущей очереди — цикл?
-    # Лучше: использовать отдельный set `in_queue_or_visited`, а для циклов — проверять при добавлении:
-    # если dep уже был посещён в этом BFS (в `nodes`) — потенциальный цикл.
-    # Однако: A → B, C → B — не цикл. Цикл: A → B → C → A.
-    # Решение: храним `depth_map`: package → min_depth. Если dep уже есть в depth_map и его depth <= current+1 — это back-edge → цикл.
-
     depth_map = {start_package: 0}
-    queue.append((start_package, 0))  # (package, depth)
+    queue = deque([(start_package, 0)])
     nodes.add(start_package)
 
     while queue:
@@ -194,34 +149,26 @@ def bfs_build_dependency_graph(
         try:
             direct_deps = fetch_deps_func(current)
         except Exception as e:
-            print(f"⚠ Пропущен пакет {current} (ошибка при получении зависимостей): {e}", file=sys.stderr)
+            print(f"⚠ Пропущен пакет {current}: {e}", file=sys.stderr)
             continue
 
         for dep in direct_deps:
-            # === Фильтрация ===
             if filter_substring and filter_substring in dep:
                 filtered_out.add(dep)
                 continue
 
-            # === Добавление ребра ===
             edges.append((current, dep))
 
-            # === Проверка цикла ===
             if dep in depth_map:
-                # dep уже посещался — проверим, является ли это back-edge (глубина <= curr_depth)
                 dep_depth = depth_map[dep]
                 if dep_depth <= curr_depth:
-                    # Возможен цикл: строим путь current → ... → dep → ... → current?
-                    # Упрощённо: фиксируем факт цикла и сохраняем участников
-                    # Для детекции полного цикла нужен DFS/DFS-стек — но по условию "корректно обработать" = обнаружить и зафиксировать.
-                    # Мы просто зафиксируем ребро как часть цикла.
-                    cycles.append([current, dep])  # можно расширить позже, но для этапа — достаточно сигнала
+                    cycles.append([current, dep])
             else:
                 depth_map[dep] = curr_depth + 1
                 nodes.add(dep)
                 queue.append((dep, curr_depth + 1))
 
-    # Убираем дубликаты циклов (по множеству узлов)
+    # Уникальные циклы
     unique_cycles = []
     seen = set()
     for cyc in cycles:
@@ -238,95 +185,120 @@ def bfs_build_dependency_graph(
     }
 
 
-# ============== ОБНОВЛЁННЫЙ main() ==============
+# =============== BFS: ОБРАТНЫЙ ГРАФ (этап 4) ===============
+
+def bfs_reverse_dependencies(
+    target_package: str,
+    all_packages: set,
+    fetch_deps_func,
+    filter_substring: str = ""
+) -> dict:
+    # Шаг 1: построить полный прямой граф
+    forward_edges = []
+    filtered_out = set()
+
+    for pkg in all_packages:
+        if filter_substring and filter_substring in pkg:
+            filtered_out.add(pkg)
+            continue
+        try:
+            deps = fetch_deps_func(pkg)
+        except:
+            continue
+        for dep in deps:
+            if filter_substring and filter_substring in dep:
+                filtered_out.add(dep)
+                continue
+            forward_edges.append((pkg, dep))
+
+    # Шаг 2: построить обратный граф
+    reverse_adj = defaultdict(list)
+    for src, dst in forward_edges:
+        reverse_adj[dst].append(src)
+
+    # Шаг 3: BFS от target по обратному графу
+    dependents = set()
+    visited = set()
+    queue = deque()
+
+    if target_package in reverse_adj:
+        queue.append(target_package)
+        visited.add(target_package)
+
+    while queue:
+        current = queue.popleft()
+        for depender in reverse_adj.get(current, []):
+            if depender not in visited:
+                visited.add(depender)
+                dependents.add(depender)
+                queue.append(depender)
+
+    # Исключаем сам пакет (если самозависимость)
+    dependents.discard(target_package)
+
+    # Собираем рёбра зависимостей
+    edges = []
+    for dep in dependents:
+        for src, dst in forward_edges:
+            if src == dep and dst == target_package:
+                edges.append((dep, target_package))
+            # Ищем транзитивные? → достаточно прямых для вывода
+    return {
+        'dependents': dependents,
+        'edges': edges,
+        'filtered_out': filtered_out
+    }
+
+
+# =============== ОСНОВНАЯ ФУНКЦИЯ ===============
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Инструмент визуализации графа зависимостей для менеджера пакетов (этапы 1–3)."
+        description="Инструмент анализа графа зависимостей (этапы 1–4)."
     )
+    parser.add_argument('--package', type=validate_package_name, required=True)
+    parser.add_argument('--repo-source', type=str, required=True)
+    parser.add_argument('--repo-mode', type=validate_repo_mode, required=True)
+    parser.add_argument('--output-image', type=validate_output_file, required=True)
+    parser.add_argument('--ascii-tree', action='store_true')
+    parser.add_argument('--filter', type=str, default='')
+    parser.add_argument('--reverse', action='store_true',
+                        help='Вывести обратные зависимости (только в mock-режиме)')
 
-    parser.add_argument(
-        '--package',
-        type=validate_package_name,
-        required=True,
-        help='Имя анализируемого пакета в формате groupId:artifactId (или одно имя для mock-режима).'
-    )
+    args = parser.parse_args()
 
-    parser.add_argument(
-        '--repo-source',
-        type=str,  # временно убираем validate_repo_source — сделаем после парсинга mode
-        required=True,
-        help='URL репозитория (remote), или путь к JSON-файлу (mock).'
-    )
-
-    parser.add_argument(
-        '--repo-mode',
-        type=validate_repo_mode,
-        required=True,
-        help='Режим: remote (Maven Central), mock (тестовый JSON-файл).'
-    )
-
-    parser.add_argument(
-        '--output-image',
-        type=validate_output_file,
-        required=True,
-        help='Имя файла изображения графа (на этапе 3 — не используется, но требуется аргументом).'
-    )
-
-    parser.add_argument(
-        '--ascii-tree',
-        action='store_true',
-        help='Режим вывода ASCII-дерева (игнорируется на этапе 3).'
-    )
-
-    parser.add_argument(
-        '--filter',
-        type=str,
-        default='',
-        help='Подстрока: пакеты, содержащие её, исключаются из анализа.'
-    )
-
-    try:
-        args = parser.parse_args()
-    except SystemExit as e:
-        sys.exit(e.code)
-
-    # === Дополнительная валидация repo-source с учётом режима ===
+    # Валидация источника
     if args.repo_mode == 'remote':
-        # Валидация URL
         parsed = urlparse(args.repo_source)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc:
-            print("Ошибка: для --repo-mode=remote требуется корректный HTTP/HTTPS URL.", file=sys.stderr)
+            print("Ошибка: некорректный URL для remote-режима.", file=sys.stderr)
             sys.exit(1)
     elif args.repo_mode == 'mock':
         if not os.path.isfile(args.repo_source):
-            print(f"Ошибка: файл '{args.repo_source}' не найден для --repo-mode=mock.", file=sys.stderr)
+            print(f"Ошибка: файл не найден: {args.repo_source}", file=sys.stderr)
             sys.exit(1)
 
-    # === Этап 1: вывод параметров ===
+    # Вывод параметров
     print("Настроенные параметры:")
-    print(f"package: {args.package}")
-    print(f"repo_source: {args.repo_source}")
-    print(f"repo_mode: {args.repo_mode}")
-    print(f"output_image: {args.output_image}")
-    print(f"ascii_tree: {args.ascii_tree}")
-    print(f"filter: '{args.filter}'")
+    print(f"  package: {args.package}")
+    print(f"  repo_source: {args.repo_source}")
+    print(f"  repo_mode: {args.repo_mode}")
+    print(f"  output_image: {args.output_image}")
+    print(f"  filter: '{args.filter}'")
+    print(f"  reverse: {args.reverse}\n")
 
-    # === Этап 2: прямые зависимости (для remote) — уже есть, но этап 3 делает транзитивные, так что этап 2 опускаем ===
-    # Перейдём сразу к этапу 3.
-
-    # === Этап 3: построение графа зависимостей ===
+    # Функция получения зависимостей
     if args.repo_mode == 'remote':
-        def fetch_deps(package):
-            pom = fetch_pom_from_remote(args.repo_source, package)
-            return parse_maven_dependencies(pom)
+        fetch_deps = lambda pkg: parse_maven_dependencies(
+            fetch_pom_from_remote(args.repo_source, pkg)
+        )
     elif args.repo_mode == 'mock':
-        def fetch_deps(package):
-            return fetch_dependencies_mock(args.repo_source, package)
+        fetch_deps = lambda pkg: fetch_dependencies_mock(args.repo_source, pkg)
     else:
-        print("Ошибка: режим 'local' не поддерживается на этапе 3.", file=sys.stderr)
+        print("Режим 'local' не поддерживается.", file=sys.stderr)
         sys.exit(1)
 
+    # === Этап 3: прямой граф ===
     try:
         graph = bfs_build_dependency_graph(
             start_package=args.package,
@@ -334,46 +306,68 @@ def main():
             filter_substring=args.filter
         )
     except Exception as e:
-        print(f"Ошибка при построении графа: {e}", file=sys.stderr)
+        print(f"Ошибка при построении прямого графа: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # === Вывод результата этапа 3 ===
-    print("\n=== Результат этапа 3: транзитивный граф зависимостей ===")
-    print(f"Всего узлов: {len(graph['nodes'])}")
-    print(f"Всего рёбер: {len(graph['edges'])}")
-    print(f"Отфильтровано: {len(graph['filtered_out'])} пакетов")
-
+    print("=== Этап 3: прямые и транзитивные зависимости ===")
+    print(f"Узлов: {len(graph['nodes'])}, Рёбер: {len(graph['edges'])}")
     if graph['filtered_out']:
-        print("Отфильтрованные пакеты:", ", ".join(sorted(graph['filtered_out'])))
-
-    print("\nРёбра графа:")
+        print("Отфильтровано:", ", ".join(sorted(graph['filtered_out'])))
+    print("Рёбра:")
     for src, dst in sorted(graph['edges']):
-        print(f"{src} → {dst}")
-
+        print(f"  {src} → {dst}")
     if graph['cycles']:
-        print(f"\n⚠ Обнаружено циклических зависимостей: {len(graph['cycles'])}")
+        print("⚠ Циклы:")
         for i, cyc in enumerate(graph['cycles'], 1):
-            print(f"  Цикл {i}: {' → '.join(cyc)}")
+            print(f"  {i}. {' → '.join(cyc)}")
     else:
-        print("\nЦиклических зависимостей не обнаружено.")
+        print("Циклов нет.")
 
-    # === Демонстрация на тестовых данных (опционально, можно удалить в продакшене) ===
-    if args.repo_mode == 'mock':
-        # Пример тестового файла (для удобства — можно создать временный)
-        demo_mock_data = {
-            "A": ["B", "C"],
-            "B": ["D"],
-            "C": ["D", "E"],
-            "D": [],
-            "E": ["B"]   # цикл: B → D ← C ← E → B (E→B, B→D, C→D, C→E)
-        }
+    # === Этап 4: обратные зависимости ===
+    if args.reverse:
+        print("\n=== Этап 4: обратные зависимости ===")
+        if args.repo_mode != 'mock':
+            print("Обратные зависимости доступны только в --repo-mode=mock.", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            with open(args.repo_source, 'r', encoding='utf-8') as f:
+                repo_data = json.load(f)
+            all_packages = set(repo_data.keys())
+        except Exception as e:
+            print(f"Ошибка загрузки репозитория: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            rev = bfs_reverse_dependencies(
+                target_package=args.package,
+                all_packages=all_packages,
+                fetch_deps_func=fetch_deps,
+                filter_substring=args.filter
+            )
+        except Exception as e:
+            print(f"Ошибка при построении обратного графа: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Пакеты, зависящие от '{args.package}': {len(rev['dependents'])}")
+        if rev['dependents']:
+            for pkg in sorted(rev['dependents']):
+                print(f"  - {pkg}")
+        else:
+            print("  Нет.")
+
+        if rev['filtered_out']:
+            print("Отфильтровано при построении:", ", ".join(sorted(rev['filtered_out'])))
+
+    # === Демо ===
+    if args.repo_mode == 'mock' and not args.reverse:
+        demo = {"A": ["B", "C"], "B": ["D"], "C": ["D", "E"], "D": [], "E": ["B"]}
         demo_path = os.path.join(tempfile.gettempdir(), "demo_repo.json")
-        with open(demo_path, 'w') as f:
-            json.dump(demo_mock_data, f)
-        print(f"\n[ДЕМО] Тестовый репозиторий сохранён в: {demo_path}")
-        print("Примеры запуска (в терминале):")
-        print(f"  python script.py --package A --repo-mode mock --repo-source {demo_path} --output-image graph.png")
-        print(f"  python script.py --package A --repo-mode mock --repo-source {demo_path} --output-image graph.png --filter D")
+        with open(demo_path, 'w', encoding='utf-8') as f:
+            json.dump(demo, f)
+        print(f"\n[ДЕМО] Примеры:")
+        print(f"  Прямые:   python practica2.py --package A --repo-mode mock --repo-source {demo_path} --output-image x.png")
+        print(f"  Обратные: python practica2.py --package B --repo-mode mock --repo-source {demo_path} --output-image x.png --reverse")
 
 
 if __name__ == "__main__":
